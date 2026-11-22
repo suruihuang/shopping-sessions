@@ -26,10 +26,10 @@ make check-dev ANSWER=dev-answer
 To iterate without rebuilding the image, compile and run the fixtures inside any Linux container that has g++ and polars:
 
 ```sh
-sh scripts/dev_check.sh        # builds with -Wall -Wextra, runs the fixtures under 6 configurations
+sh scripts/dev_check.sh        # builds with -Wall -Wextra, runs the fixtures under 7 configurations
 ```
 
-`dev_check.sh` varies the thread count, the chunk size (down to one byte) and the partition counts, and runs once with every fast path switched off. Every configuration must pass all 36 fixtures, because none of those settings may change the output.
+`dev_check.sh` varies the thread count, the chunk size (down to one byte) and the partition counts, runs once with every fast path switched off and once with a string table of 64 slots. Every configuration must pass all 36 fixtures, because none of those settings may change the output.
 
 The image holds nothing but the binary. `scripts/docker_run.sh` cleans up after a run by calling `chmod` inside the image, which this image does not have: on a Linux host where you are not uid 1000, the output folder stays owned by uid 1000 and you remove it with `sudo`.
 
@@ -48,7 +48,11 @@ Every phase runs on all threads.
 
 ### Choices that keep it exact
 
-- **IDs are integers, losslessly.** An ID of up to 10 characters from `[0-9A-Za-z_]` is packed into 60 bits, 6 bits a character in ASCII order, so integer order equals byte order. Any other ID (a space, a tab, a non-ASCII byte, longer than 10) is interned in an exact string table and compared through its bytes. No hash stands in for an ID anywhere.
+- **Short IDs are integers, losslessly.** An ID of up to 10 characters from `[0-9A-Za-z_]` is packed into 60 bits, 6 bits a character in ASCII order, so integer order equals byte order.
+- **Any other ID is handled as its bytes** (longer than 10, a space, a tab, a non-ASCII byte). No hash stands in for an ID anywhere:
+  - A user ID is interned in a lock-free exact string table, so equal strings get equal keys.
+  - An event ID stays where it is in the mapped file. Its token carries 27 bits of a hash to file and find it, and dedup compares the bytes before it calls two tokens one event.
+  - A click ID is a pointer and a length. Click IDs are only ever ordered, never matched.
 - **The CSV dialect is hand-written.** Only `\n` ends a line, every comma separates fields, and a quote is legal only as the first and last character of a field. A line passes when its quotes number exactly twice its fields that begin and end with one.
 - **Timestamps have a fast path and a general path that accept the same strings.** The fast path looks the ten date characters up in a table of the days around the window; a date that is not there cannot be in a window. The general path does the full calendar check.
 - **Click duplicates are not removed.** The rules say copies of a click are identical, so they can change neither the credited campaign nor the set of assisting campaigns.
@@ -58,6 +62,7 @@ Every phase runs on all threads.
 
 - A window longer than about 42 days (timestamps are kept as 32-bit milliseconds from 7 days before the window).
 - More than 254 product categories.
+- More than 268 million event IDs that do not pack, seen by one thread.
 
 ## Testing knobs
 
@@ -71,15 +76,18 @@ These environment variables exist for testing and must never change the output.
 | `SS_NOWC` | Plain stores instead of write-combining lines and non-temporal stores |
 | `SS_NOTHP` | Do not ask for huge pages |
 | `SS_NOFAST` | Timestamps through the general parser only |
+| `SS_INTERN` | Slots in the string table, default input bytes / 2048. A tiny value forces the overflow table |
 | `SS_NOMMAP` | Read the inputs into memory instead of mapping them (the path taken when a file cannot be mapped) |
 
 ## Measured
 
-On a laptop (i7-13620H, 8 threads, files in the page cache), whole process:
+On a laptop (i7-13620H, 8 threads, files in the page cache), whole process, with inputs whose IDs are all short:
 
 | Dataset | Time | Peak memory |
 | --- | --- | --- |
 | 20M events, 5M clicks | about 0.6 s | 2.7 GB including the mapped input |
 | 60M events, 15M clicks | about 1.8 s | 7.9 GB including the mapped input |
+
+With the current generator, where one ID in eight is 33 characters long, the 20M set takes about 17% longer (measured back to back) and peak memory is 2.9 GB at 20M and 8.5 GB at 60M.
 
 The scorer has 4 cores with 8 hyperthreads, so its times will differ; only the board's times count.

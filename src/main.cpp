@@ -7,15 +7,18 @@
 //      line is valid, a record (person, ts, price, category), filed by a hash of the person. A
 //      valid click becomes a record filed by person. Click duplicates are left in: copies are
 //      identical, so they can change neither the credit nor the set of assisting campaigns.
+//      IDs of up to 10 word characters are packed into integers. Longer ones stay bytes: a user
+//      ID is interned in a lock-free table, an event ID is left in the mapped file and its
+//      token points at it, a click ID is a pointer and a length.
 //   3. dedup: per token partition, the copy with the smallest ingest_ts wins and every other
 //      copy's record is marked dropped. An invalid winner has no record, so the event is gone.
 //   4. per person partition: group by person, sort by time, sessionize, credit, count assists,
 //      and write user_daily a row group at a time. campaign_daily is summed from per-thread grids.
 //
 // Environment, besides DATA_DIR, OUTPUT_DIR and NCPU: SS_CHUNK (bytes of input per unit of work),
-// SS_PARTS and SS_TP (partition counts), SS_NOWC, SS_NOTHP, SS_NOFAST and SS_NOMMAP switch off
-// write combining, huge pages, the timestamp fast paths and input mapping. They exist for
-// testing: every setting must give the same output.
+// SS_PARTS and SS_TP (partition counts), SS_INTERN (slots in the string table), SS_NOWC, SS_NOTHP,
+// SS_NOFAST and SS_NOMMAP switch off write combining, huge pages, the timestamp fast paths and
+// input mapping. They exist for testing: every setting must give the same output.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -73,10 +76,18 @@ static void lap(const char* what) {
 // Keys. An ID of up to 10 characters from [0-9A-Z_a-z] is packed losslessly into
 // 60 bits, 6 bits a character, first character highest, codes in ASCII order: so
 // two packed keys compare as integers exactly as their strings compare byte-wise.
-// Any other ID is interned in an exact string table and gets a key with bit 63
-// set; such keys are identities only and are compared through their bytes.
+// Any other ID gets a key with bit 63 set; such keys are compared through their bytes:
+//   tag 01  interned: a canonical copy of the string, so equal strings have equal keys.
+//           The low 48 bits point at the copy (a 4-byte length, then the bytes).
+//   tag 10  by reference: a length and a pointer to bytes that stay readable. Equal
+//           strings need not have equal keys, so only where a key is never tested for
+//           equality (a click's own ID).
+//   tag 00  interned in the overflow table, when the main one is crowded.
 // ---------------------------------------------------------------------------
 static const u64 FB = 1ull << 63;
+static const u64 TAG_MASK = 3ull << 61, TAG_ARENA = 1ull << 61, TAG_REF = 2ull << 61;
+static const u64 PTR47 = (1ull << 47) - 1, PTR48 = (1ull << 48) - 1;
+static const size_t REF_MAXLEN = 1u << 14;
 static u8 CODE[256];
 static char DECODE[64];
 
@@ -88,16 +99,69 @@ static void init_codes() {
     for (int ch = 'a'; ch <= 'z'; ch++) { CODE[ch] = c; DECODE[c++] = (char)ch; }
 }
 
+static inline u64 hash_bytes(const char* p, size_t n) {
+    u64 h = (u64)n * 0x9E3779B97F4A7C15ull;
+    while (n >= 8) {
+        u64 w;
+        memcpy(&w, p, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdULL;
+        h ^= h >> 32;
+        p += 8;
+        n -= 8;
+    }
+    if (n) {
+        u64 w = 0;
+        memcpy(&w, p, n);
+        h = (h ^ w) * 0xff51afd7ed558ccdULL;
+        h ^= h >> 32;
+    }
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    return h ^ (h >> 33);
+}
+
+// Bytes that must outlive their source: bump allocation, a thread's own, never freed.
+static thread_local char* arena_cur = nullptr;
+static thread_local char* arena_end = nullptr;
+static inline char* arena_room(size_t n) {  // 8-byte aligned; the caller commits by moving arena_cur
+    if (__builtin_expect((size_t)(arena_end - arena_cur) < n, 0)) {
+        const size_t sz = max<size_t>(n, 1u << 20);
+        arena_cur = (char*)malloc(sz);
+        if (!arena_cur) { fprintf(stderr, "out of memory\n"); _exit(1); }
+        arena_end = arena_cur + sz;
+    }
+    return arena_cur;
+}
+static inline const char* arena_copy(const char* p, size_t n) {
+    char* d = arena_room((n + 7) & ~(size_t)7);
+    memcpy(d, p, n);
+    arena_cur = d + ((n + 7) & ~(size_t)7);
+    return d;
+}
+
+// The exact string table. Lock-free: a slot is 0 or a 16-bit fingerprint over a pointer to
+// a finished copy, and a slot never changes once set. A string that finds its first PROBES
+// slots taken by others goes to the overflow table; those slots stay taken, so the same
+// string goes there every time.
 struct Intern {
-    static const int NS = 64;
+    static const int NS = 64, PROBES = 32;
     struct Shard {
         mutex m;
         unordered_map<string, u32> map;
         deque<string> strs;
     } sh[NS];
-    u64 get(const char* p, size_t n) {
+    atomic<u64>* slots = nullptr;
+    u64 mask = 0;
+    void init(size_t want) {
+        size_t n = 64;
+        while (n < want) n <<= 1;
+        void* m = mmap(nullptr, n * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) { fprintf(stderr, "out of memory\n"); _exit(1); }
+        madvise(m, n * 8, MADV_HUGEPAGE);
+        slots = (atomic<u64>*)m;
+        mask = n - 1;
+    }
+    u64 overflow(const char* p, size_t n, u64 h) {
         string s(p, n);
-        size_t h = hash<string>()(s);
         Shard& S = sh[h % NS];
         lock_guard<mutex> g(S.m);
         auto it = S.map.find(s);
@@ -111,7 +175,44 @@ struct Intern {
         }
         return FB | ((u64)id << 6) | (h % NS);
     }
+    u64 get(const char* p, size_t n) {
+        const u64 h = hash_bytes(p, n);
+        if (__builtin_expect(n > 0xFFFFFFF0u, 0)) return overflow(p, n, h);
+        const u64 fp = (h >> 48) << 48;
+        char* rec = nullptr;
+        size_t i = (size_t)(h & mask);
+        for (int probe = 0; probe < PROBES; probe++, i = (i + 1) & mask) {
+            u64 v = slots[i].load(memory_order_acquire);
+            if (!v) {
+                if (!rec) {
+                    rec = arena_room((n + 4 + 7) & ~(size_t)7);
+                    const u32 len = (u32)n;
+                    memcpy(rec, &len, 4);
+                    memcpy(rec + 4, p, n);
+                }
+                if ((u64)(uintptr_t)rec > PTR48) return overflow(p, n, h);
+                if (slots[i].compare_exchange_strong(v, fp | (u64)(uintptr_t)rec, memory_order_acq_rel)) {
+                    arena_cur = rec + ((n + 4 + 7) & ~(size_t)7);
+                    return FB | TAG_ARENA | (u64)(uintptr_t)rec;
+                }
+            }
+            if ((v >> 48 << 48) == fp) {
+                const char* r = (const char*)(uintptr_t)(v & PTR48);
+                u32 len;
+                memcpy(&len, r, 4);
+                if (len == n && memcmp(r + 4, p, n) == 0) return FB | TAG_ARENA | (v & PTR48);
+            }
+        }
+        return overflow(p, n, h);
+    }
     string_view str(u64 key) {
+        if ((key & TAG_MASK) == TAG_ARENA) {
+            const char* r = (const char*)(uintptr_t)(key & PTR48);
+            u32 len;
+            memcpy(&len, r, 4);
+            return string_view(r + 4, len);
+        }
+        if ((key & TAG_MASK) == TAG_REF) return string_view((const char*)(uintptr_t)(key & PTR47), (size_t)((key >> 47) & (REF_MAXLEN - 1)));
         Shard& S = sh[key & 63];
         lock_guard<mutex> g(S.m);
         return S.strs[(key & ~FB) >> 6];  // deque elements never move
@@ -842,6 +943,11 @@ struct Alloc {
 // as the timestamps do while ingest_ts is whole seconds (the rules: always F1) within about
 // 34 years before and 100 after the window; beyond either, copies would tie.
 struct Tok { u64 ev; u32 ing; u32 addr; };   // addr: the event's record, NOADDR for an invalid copy
+// ev is the packed event ID, or for an ID that does not pack: bit 63, 27 bits of a hash of the
+// bytes, the thread that saw it (8 bits) and its index in that thread's `side` (28 bits). The
+// hash bits file and find such a token; the bytes decide whether two of them are one event.
+static const u64 EV_LOC = (1ull << 36) - 1;
+static inline u64 ev_key(u64 ev) { return ev & ~((u64)((i64)ev >> 63) & EV_LOC); }
 struct PEv { u64 person; u64 w; };           // a valid event: w = ts << 32 | price << 8 | category; ~0 once dropped
 struct Clk { u64 user; u64 id; u32 ts; u32 camp; };  // a valid click; user is the person
 struct CItem { u64 tc; u64 id; };             // a click inside the person stage: tc = ts << 32 | campaign
@@ -867,6 +973,10 @@ struct alignas(64) Ctx {
     vector<u64> bl[3];  // partition << 32 | block address, in the order the blocks were taken
     Lists ls[3];
     vector<pair<u64, u64>> links;
+    // Event IDs that do not pack: where the bytes are (length << 47 | pointer, or bit 63 over an
+    // index into `huge`). A token names its entry by thread and index.
+    vector<u64> side;
+    vector<pair<const char*, size_t>> huge;
     // dedup
     vector<u64> tab;
     // person stage
@@ -1359,7 +1469,18 @@ int main() {
         while (TB < 12 && (3ull << TB) < target * 2) TB++;  // the power of two nearest the target
     }
     const u32 TP = 1u << TB;
-    auto tpart = [TB](u64 ev) -> u32 { return TB ? (u32)((ev * 0x9E3779B97F4A7C15ull) >> (64 - TB)) : 0; };
+    auto tpart = [TB](u64 ev) -> u32 {
+        if (!TB) return 0;
+        const u32 a = (u32)((ev * 0x9E3779B97F4A7C15ull) >> (64 - TB)), b = (u32)((ev << 1) >> (64 - TB));
+        return (ev & FB) ? b : a;
+    };
+    {
+        u64 all = ev_bytes;
+        for (auto* v : {&ck_files, &ln_files})
+            for (auto& f : *v) all += f.size;
+        const u64 want = strtoull(env("SS_INTERN", "0").c_str(), nullptr, 10);
+        intern.init(want ? (size_t)want : (size_t)max<u64>(4096, all / 2048));
+    }
 
     pool.start(NT);
     vector<Ctx> ctx(NT);
@@ -1483,11 +1604,35 @@ int main() {
                 const u64 person = linked ? resolve_at((size_t)c.home << 2, c.user) : c.user;
                 put_clk(me, (u32)(mix(person) >> 32 & PMASK), Clk{person, c.id, c.ts, c.camp});
             };
+            // Bytes that the unit of work will overwrite (the padded copy of a file's end) are
+            // copied; everything else is in an input that stays mapped.
+            auto stable = [&](const char* p, size_t n) -> const char* {
+                return (uintptr_t)p - (uintptr_t)me.tail.data() < me.tail.size() ? arena_copy(p, n) : p;
+            };
+            auto long_ev = [&](const char* p, size_t n) __attribute__((noinline)) -> u64 {
+                const u64 h = hash_bytes(p, n);
+                const char* q = stable(p, n);
+                const size_t idx = me.side.size();
+                if (idx >> 28) die("too many long event ids for this build");
+                if (n < (1u << 16) && !((u64)(uintptr_t)q >> 47)) {  // bit 63 stays clear
+                    me.side.push_back((u64)n << 47 | (u64)(uintptr_t)q);
+                } else {
+                    me.side.push_back(FB | (u64)me.huge.size());
+                    me.huge.push_back({q, n});
+                }
+                return FB | (h >> 37 << 36) | (u64)t << 28 | (u64)idx;
+            };
+            auto ref_key = [&](const char* p, size_t n) __attribute__((noinline)) -> u64 {
+                if (n >= REF_MAXLEN) return intern.get(p, n);
+                const char* q = stable(p, n);
+                if ((u64)(uintptr_t)q >> 47) return intern.get(p, n);
+                return FB | TAG_REF | (u64)n << 47 | (u64)(uintptr_t)q;
+            };
             auto on_event = [&](const char** f, const u32* l) __attribute__((always_inline)) {
                 if (!l[0]) return;
                 u64 ev, user;
                 const unsigned packed = pack2(f[0], l[0], f[1], l[1], ev, user);
-                if (__builtin_expect(!(packed & 1), 0)) ev = pack(f[0], l[0]);
+                if (__builtin_expect(!(packed & 1), 0)) ev = long_ev(f[0], l[0]);
                 i64 ing = 0, ts = 0;
                 if (!parse_ts_any(f[3], l[3], ing)) ing = 0;
                 const i64 isec = floor_div(ing, 1000) - ING_BASE;
@@ -1543,7 +1688,7 @@ int main() {
                 if (camp < 0) return;
                 u64 id, user;
                 const unsigned packed = pack2(f[0], l[0], f[1], l[1], id, user);
-                if (__builtin_expect(!(packed & 1), 0)) id = pack(f[0], l[0]);
+                if (__builtin_expect(!(packed & 1), 0)) id = ref_key(f[0], l[0]);
                 if (__builtin_expect(!(packed & 2), 0)) user = pack(f[1], l[1]);
                 PendCk& k = cring[ct++ & 31];
                 k.user = user;
@@ -1578,11 +1723,13 @@ int main() {
 
     // The inputs are no longer needed. Unmapping 2 GB one page at a time is slow on the way out
     // of a process, where one thread does it; here the workers share it, at the start of phase 3.
-    vector<const MFile*> inputs;
-    for (auto* v : {&ev_files, &ck_files, &ln_files})
-        for (auto& f : *v)
-            if (f.is_map) inputs.push_back(&f);
-    atomic<size_t> next_unmap{0};
+    // The link files go now. Event files go once every thread is done with dedup, which reads
+    // the long event IDs in them; click files once the person stage is done with the long click IDs.
+    atomic<size_t> unmap_ln{0}, unmap_ev{0}, unmap_ck{0};
+    auto unmap_some = [](const vector<MFile>& files, atomic<size_t>& at) {
+        for (size_t i; (i = at.fetch_add(1)) < files.size();)
+            if (files[i].is_map) munmap((void*)files[i].p, files[i].size);
+    };
 
     // ---- phase 3: dedup. Among the copies of an event the smallest ingest_ts wins; every other
     // copy that made a record gets the record dropped. An invalid winner has no record at all.
@@ -1595,7 +1742,13 @@ int main() {
             auto drop = [](u32 addr) {
                 if (addr != NOADDR) ((PEv*)addr_ptr(addr))->w = ~0ull;
             };
-            for (size_t i; (i = next_unmap.fetch_add(1)) < inputs.size();) munmap((void*)inputs[i]->p, inputs[i]->size);
+            unmap_some(ln_files, unmap_ln);
+            auto id_bytes = [&](u64 ev) -> string_view {
+                const Ctx& c = ctx[(ev >> 28) & 255];
+                const u64 e = c.side[ev & 0xFFFFFFF];
+                if (e & FB) return string_view(c.huge[e & ~FB].first, c.huge[e & ~FB].second);
+                return string_view((const char*)(uintptr_t)(e & PTR47), (size_t)(e >> 47));
+            };
             for (u32 p; (p = next.fetch_add(1)) < TP;) {
                 bp.clear();
                 bn.clear();
@@ -1614,7 +1767,8 @@ int main() {
                     const Tok* b = bp[o];
                     for (u32 i = 0, k = bn[o]; i < k; i++) {
                         const Tok& tk = b[i];
-                        const u64 h = mix(tk.ev);
+                        const u64 kev = ev_key(tk.ev);
+                        const u64 h = mix(kev);
                         const u64 tag = (h >> 32) | 1;
                         const u64 self = tag << 32 | (u64)(o << 8 | i);
                         for (u64 s = h & m;; s = (s + 1) & m) {
@@ -1622,7 +1776,8 @@ int main() {
                             if (!e) { tab[s] = self; break; }
                             if ((e >> 32) != tag) continue;
                             const Tok& ot = bp[(u32)e >> 8][(u32)e & 255];
-                            if (ot.ev != tk.ev) continue;
+                            if (ev_key(ot.ev) != kev) continue;
+                            if ((kev & FB) && id_bytes(ot.ev) != id_bytes(tk.ev)) continue;
                             if (tk.ing < ot.ing) { drop(ot.addr); tab[s] = self; }
                             else drop(tk.addr);
                             break;
@@ -1659,6 +1814,7 @@ int main() {
         const int nd = NDAYS;
         pool.run([&](int t) {
             Ctx& me = ctx[t];
+            unmap_some(ev_files, unmap_ev);  // every thread is past dedup
             me.seen.assign(NCAMP + 1, 0);
             me.wcnt.assign(NCAMP + 1, 0);
             me.wpos.assign(NCAMP + 1, 0);
@@ -1886,6 +2042,7 @@ int main() {
             out.finish(t == 0);  // thread 0 always writes, so the table always has a file
             total_rows += nrows;
         });
+        pool.run([&](int) { unmap_some(ck_files, unmap_ck); });
     }
     lap("sessions built and user_daily written");
 

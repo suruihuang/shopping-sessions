@@ -77,16 +77,17 @@ static void lap(const char* what) {
 // 60 bits, 6 bits a character, first character highest, codes in ASCII order: so
 // two packed keys compare as integers exactly as their strings compare byte-wise.
 // Any other ID gets a key with bit 63 set; such keys are compared through their bytes:
-//   tag 01  interned: a canonical copy of the string, so equal strings have equal keys.
-//           The low 48 bits point at the copy (a 4-byte length, then the bytes).
+//   tag 01  interned: an entry of the string table, so equal strings have equal keys.
+//           Bits 60..28 are the top 33 bits of the string's hash, bits 27..0 the entry.
 //   tag 10  by reference: a length and a pointer to bytes that stay readable. Equal
 //           strings need not have equal keys, so only where a key is never tested for
 //           equality (a click's own ID).
 //   tag 00  interned in the overflow table, when the main one is crowded.
 // ---------------------------------------------------------------------------
 static const u64 FB = 1ull << 63;
-static const u64 TAG_MASK = 3ull << 61, TAG_ARENA = 1ull << 61, TAG_REF = 2ull << 61;
-static const u64 PTR47 = (1ull << 47) - 1, PTR48 = (1ull << 48) - 1;
+static const u64 TAG_MASK = 3ull << 61, TAG_ENT = 1ull << 61, TAG_REF = 2ull << 61;
+static const u64 PTR47 = (1ull << 47) - 1;
+static const int ENT_BITS = 28;
 static const size_t REF_MAXLEN = 1u << 14;
 static u8 CODE[256];
 static char DECODE[64];
@@ -138,26 +139,34 @@ static inline const char* arena_copy(const char* p, size_t n) {
     return d;
 }
 
-// The exact string table. Lock-free: a slot is 0 or a 16-bit fingerprint over a pointer to
-// a finished copy, and a slot never changes once set. A string that finds its first PROBES
-// slots taken by others goes to the overflow table; those slots stay taken, so the same
-// string goes there every time.
+// The exact string table. An entry is one cache line and holds the string itself when it
+// fits, so a lookup reads one line, and the line can be asked for as soon as the hash is
+// known. Lock-free: an entry goes from empty to being written to written, and never changes
+// again. A string that finds its first PROBES entries taken by others goes to the overflow
+// table; those entries stay taken, so the same string goes there every time.
 struct Intern {
-    static const int NS = 64, PROBES = 32;
+    static const int NS = 64, PROBES = 16;
+    static const size_t INLINE = 40;
+    struct alignas(64) Ent {
+        atomic<u64> tag;     // 0: empty; 1: being written; otherwise 2 + the string's length
+        u64 hash;
+        char bytes[INLINE];  // the string, if it fits
+        const char* far;     // otherwise a copy that stays
+    };
     struct Shard {
         mutex m;
         unordered_map<string, u32> map;
         deque<string> strs;
     } sh[NS];
-    atomic<u64>* slots = nullptr;
+    Ent* ents = nullptr;
     u64 mask = 0;
     void init(size_t want) {
         size_t n = 64;
-        while (n < want) n <<= 1;
-        void* m = mmap(nullptr, n * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        while (n < want && n < ((size_t)1 << ENT_BITS)) n <<= 1;
+        void* m = mmap(nullptr, n * sizeof(Ent), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m == MAP_FAILED) { fprintf(stderr, "out of memory\n"); _exit(1); }
-        madvise(m, n * 8, MADV_HUGEPAGE);
-        slots = (atomic<u64>*)m;
+        madvise(m, n * sizeof(Ent), MADV_HUGEPAGE);
+        ents = (Ent*)m;
         mask = n - 1;
     }
     u64 overflow(const char* p, size_t n, u64 h) {
@@ -175,42 +184,35 @@ struct Intern {
         }
         return FB | ((u64)id << 6) | (h % NS);
     }
-    u64 get(const char* p, size_t n) {
-        const u64 h = hash_bytes(p, n);
-        if (__builtin_expect(n > 0xFFFFFFF0u, 0)) return overflow(p, n, h);
-        const u64 fp = (h >> 48) << 48;
-        char* rec = nullptr;
+    static inline u64 key_of(u64 h, size_t i) { return FB | TAG_ENT | (h >> 31 << ENT_BITS) | (u64)i; }
+    inline void prefetch(u64 h) const { __builtin_prefetch(&ents[h & mask]); }
+    // h must be hash_bytes(p, n).
+    u64 get(const char* p, size_t n, u64 h) {
         size_t i = (size_t)(h & mask);
         for (int probe = 0; probe < PROBES; probe++, i = (i + 1) & mask) {
-            u64 v = slots[i].load(memory_order_acquire);
-            if (!v) {
-                if (!rec) {
-                    rec = arena_room((n + 4 + 7) & ~(size_t)7);
-                    const u32 len = (u32)n;
-                    memcpy(rec, &len, 4);
-                    memcpy(rec + 4, p, n);
-                }
-                if ((u64)(uintptr_t)rec > PTR48) return overflow(p, n, h);
-                if (slots[i].compare_exchange_strong(v, fp | (u64)(uintptr_t)rec, memory_order_acq_rel)) {
-                    arena_cur = rec + ((n + 4 + 7) & ~(size_t)7);
-                    return FB | TAG_ARENA | (u64)(uintptr_t)rec;
-                }
+            Ent& e = ents[i];
+            u64 t = e.tag.load(memory_order_acquire);
+            if (t == 0 && e.tag.compare_exchange_strong(t, 1, memory_order_acq_rel)) {
+                e.hash = h;
+                if (n <= INLINE) memcpy(e.bytes, p, n);
+                else e.far = arena_copy(p, n);
+                e.tag.store(2 + (u64)n, memory_order_release);
+                return key_of(h, i);
             }
-            if ((v >> 48 << 48) == fp) {
-                const char* r = (const char*)(uintptr_t)(v & PTR48);
-                u32 len;
-                memcpy(&len, r, 4);
-                if (len == n && memcmp(r + 4, p, n) == 0) return FB | TAG_ARENA | (v & PTR48);
+            while (t == 1) {  // another thread is writing it: wait for the string
+                _mm_pause();
+                t = e.tag.load(memory_order_acquire);
             }
+            if (t == 2 + (u64)n && e.hash == h && memcmp(n <= INLINE ? e.bytes : e.far, p, n) == 0) return key_of(h, i);
         }
         return overflow(p, n, h);
     }
+    u64 get(const char* p, size_t n) { return get(p, n, hash_bytes(p, n)); }
     string_view str(u64 key) {
-        if ((key & TAG_MASK) == TAG_ARENA) {
-            const char* r = (const char*)(uintptr_t)(key & PTR48);
-            u32 len;
-            memcpy(&len, r, 4);
-            return string_view(r + 4, len);
+        if ((key & TAG_MASK) == TAG_ENT) {
+            const Ent& e = ents[key & (((u64)1 << ENT_BITS) - 1)];
+            const size_t n = (size_t)(e.tag.load(memory_order_relaxed) - 2);
+            return string_view(n <= INLINE ? e.bytes : e.far, n);
         }
         if ((key & TAG_MASK) == TAG_REF) return string_view((const char*)(uintptr_t)(key & PTR47), (size_t)((key >> 47) & (REF_MAXLEN - 1)));
         Shard& S = sh[key & 63];
@@ -1355,14 +1357,21 @@ struct LEnt { atomic<u64> key; atomic<u64> v; };
 static LEnt* LT = nullptr;
 static u64 LN = 0, LNB = 0;  // slots, and cache lines of 4 slots
 
-static inline u64 lhash(u64 k) {
+static inline u64 lmix(u64 k) {
     k ^= k >> 32;
     k *= 0x9E3779B97F4A7C15ull;
     k ^= k >> 29;
     return k;
 }
+// An interned key is hashed by the 33 hash bits it carries. They come from the string alone,
+// so the line can be asked for before the string table has been read.
+static inline u64 lhash(u64 k) {
+    return lmix((k & (FB | TAG_MASK)) == (FB | TAG_ENT) ? (k >> ENT_BITS) & 0x1FFFFFFFFull : k);
+}
 // A probe starts at the first slot of a cache line, so it rarely leaves the line.
 static inline size_t lhome(u64 k) { return (size_t)(((unsigned __int128)lhash(k) * LNB) >> 64) << 2; }
+// The home of the interned key a string with hash h gets.
+static inline size_t lhome_hash(u64 h) { return (size_t)(((unsigned __int128)lmix(h >> 31) * LNB) >> 64) << 2; }
 
 static inline size_t link_slot(u64 k, bool& created) {
     size_t i = lhome(k);
@@ -1479,7 +1488,7 @@ int main() {
         for (auto* v : {&ck_files, &ln_files})
             for (auto& f : *v) all += f.size;
         const u64 want = strtoull(env("SS_INTERN", "0").c_str(), nullptr, 10);
-        intern.init(want ? (size_t)want : (size_t)max<u64>(4096, all / 2048));
+        intern.init(want ? (size_t)want : (size_t)max<u64>(4096, all / 4096));
     }
 
     pool.start(NT);
@@ -1580,13 +1589,14 @@ int main() {
         add_chunks(work, ck_files, 2, CHUNK);
         atomic<size_t> next{0};
         const i64 ws = WS, we = WE, base = BASE;
-        struct PendEv { u64 user, ev; u32 ts, pc, ing, home; };
-        struct PendCk { u64 user, id; u32 ts, camp, home; };
+        struct PendEv { u64 user, ev, uh; u32 ts, pc, ing, home; };
+        struct PendCk { u64 user, id, uh; u32 ts, camp, home; };
         const bool linked = LN != 0;
+        const unsigned RING_AHEAD = 8;  // long enough for the line to come, short enough for it to stay in the cache
         pool.run([&](int t) {
             Ctx& me = ctx[t];
             // A record needs its person, a lookup that misses the cache: rows wait in a ring
-            // until the line asked for 16 rows ago has arrived.
+            // until the line asked for 8 rows ago has arrived.
             PendEv ering[32];
             PendCk cring[32];
             unsigned eh = 0, et = 0, ch = 0, ct = 0;
@@ -1595,13 +1605,37 @@ int main() {
                 me.wc[K_REC] = (char*)aligned_alloc(64, (size_t)P * 64);
                 if (!me.wc[K_TOK] || !me.wc[K_REC]) die("out of memory");
             }
+            // A user ID that does not pack waits in the ring as a reference to its bytes, with
+            // its hash: its line of the string table was asked for when the row came in, and
+            // is read when the row leaves. The bytes are still there: a unit of work empties
+            // the ring before its buffer is used again.
+            auto ring_user = [&](const char* p, size_t n, u64& uh) __attribute__((always_inline)) -> u64 {
+                uh = hash_bytes(p, n);
+                if (__builtin_expect(n >= REF_MAXLEN || ((u64)(uintptr_t)p >> 47), 0)) return intern.get(p, n, uh);
+                intern.prefetch(uh);
+                return FB | TAG_REF | (u64)n << 47 | (u64)(uintptr_t)p;
+            };
+            auto ring_home = [&](u64 user, u64 uh) __attribute__((always_inline)) -> size_t {
+                return (user & (FB | TAG_MASK)) == (FB | TAG_REF) ? lhome_hash(uh) : lhome(user);
+            };
+            auto late_user = [&](u64 user, u64 uh, u32& home) __attribute__((always_inline)) -> u64 {
+                if (__builtin_expect((user & (FB | TAG_MASK)) != (FB | TAG_REF), 1)) return user;
+                user = intern.get((const char*)(uintptr_t)(user & PTR47), (size_t)((user >> 47) & (REF_MAXLEN - 1)), uh);
+                // In the overflow table the key is hashed otherwise: another line, not asked for.
+                if (__builtin_expect((user & TAG_MASK) != TAG_ENT, 0) && linked) home = (u32)(lhome(user) >> 2);
+                return user;
+            };
             auto emit_ev = [&](const PendEv& e) __attribute__((always_inline)) {
-                const u64 person = linked ? resolve_at((size_t)e.home << 2, e.user) : e.user;
+                u32 home = e.home;
+                const u64 user = late_user(e.user, e.uh, home);
+                const u64 person = linked ? resolve_at((size_t)home << 2, user) : user;
                 const u32 addr = put_rec(me, (u32)(mix(person) >> 32 & PMASK), person, (u64)e.ts << 32 | e.pc);
                 put_tok(me, tpart(e.ev), e.ev, e.ing, addr);
             };
             auto emit_ck = [&](const PendCk& c) __attribute__((always_inline)) {
-                const u64 person = linked ? resolve_at((size_t)c.home << 2, c.user) : c.user;
+                u32 home = c.home;
+                const u64 user = late_user(c.user, c.uh, home);
+                const u64 person = linked ? resolve_at((size_t)home << 2, user) : user;
                 put_clk(me, (u32)(mix(person) >> 32 & PMASK), Clk{person, c.id, c.ts, c.camp});
             };
             // Bytes that the unit of work will overwrite (the padded copy of a file's end) are
@@ -1666,19 +1700,21 @@ int main() {
                     valid = true;
                 } while (0);
                 if (!valid) { put_tok(me, tpart(ev), ev, ing32, NOADDR); return; }
-                if (__builtin_expect(!(packed & 2), 0)) user = pack(f[1], l[1]);
+                u64 uh = 0;
+                if (__builtin_expect(!(packed & 2), 0)) user = ring_user(f[1], l[1], uh);
                 PendEv& e = ering[et++ & 31];
                 e.user = user;
                 e.ev = ev;
+                e.uh = uh;
                 e.ts = (u32)(ts - base);
                 e.pc = pc;
                 e.ing = ing32;
                 if (linked) {
-                    const size_t home = lhome(user);
+                    const size_t home = ring_home(user, uh);
                     e.home = (u32)(home >> 2);
                     __builtin_prefetch(&LT[home]);
                 }
-                if (et - eh > 16) emit_ev(ering[eh++ & 31]);
+                if (et - eh > RING_AHEAD) emit_ev(ering[eh++ & 31]);
             };
             auto on_click = [&](const char** f, const u32* l) __attribute__((always_inline)) {
                 if (!l[0] || !l[1] || !l[2]) return;
@@ -1689,18 +1725,20 @@ int main() {
                 u64 id, user;
                 const unsigned packed = pack2(f[0], l[0], f[1], l[1], id, user);
                 if (__builtin_expect(!(packed & 1), 0)) id = ref_key(f[0], l[0]);
-                if (__builtin_expect(!(packed & 2), 0)) user = pack(f[1], l[1]);
+                u64 uh = 0;
+                if (__builtin_expect(!(packed & 2), 0)) user = ring_user(f[1], l[1], uh);
                 PendCk& k = cring[ct++ & 31];
                 k.user = user;
                 k.id = id;
+                k.uh = uh;
                 k.ts = (u32)(ts - base);
                 k.camp = (u32)camp;
                 if (linked) {
-                    const size_t home = lhome(user);
+                    const size_t home = ring_home(user, uh);
                     k.home = (u32)(home >> 2);
                     __builtin_prefetch(&LT[home]);
                 }
-                if (ct - ch > 16) emit_ck(cring[ch++ & 31]);
+                if (ct - ch > RING_AHEAD) emit_ck(cring[ch++ & 31]);
             };
             for (size_t i; (i = next.fetch_add(1)) < work.size();) {
                 Work& w = work[i];

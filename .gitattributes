@@ -1,0 +1,3 @@
+# Store every file byte for byte. Fixture E20 has \r inside fields on purpose,
+# and core.autocrlf would otherwise strip it on commit.
+* -text

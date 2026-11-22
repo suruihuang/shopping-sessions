@@ -1,0 +1,6 @@
+dev/
+out/
+build/
+dev-answer/
+*.zip
+__pycache__/
